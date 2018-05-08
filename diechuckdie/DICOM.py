@@ -1,16 +1,19 @@
 
 from joblib import Parallel, delayed
-from copy import deepcopy
 from tqdm import tqdm
-from scipy.integrate import cumtrapz, simps
-from scipy.optimize import curve_fit, root
+from sys import exit
+import pydicom
+import logging
+
+from os import listdir
+from os.path import isfile, join
+
 import tempfile
 import shutil
 import numpy as np
 import SimpleITK as sitk
 from glob import glob
 import sys, time, os
-import dicom
 import os, os.path, sys, configparser, collections
 import importlib.util
 from jsonpath_rw import jsonpath, parse
@@ -18,35 +21,104 @@ import scipy.misc
 from numpy import sin, cos, tan, exp
 from tqdm import tqdm_notebook
 
+from . import helpers
+
+
 
 
 class DICOM (object):
     def __init__ (self):
         self.debugLevel = 5
         self.sitk_ndarray = None
-        pass
+        self.filterDICOM = True
+
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)  # __name__=projectA.moduleB
+        self.logger.debug("Constructing DICOM Object.")
 
 
-    def copyFrom (self, other):
-        self.debugLevel = other.debugLevel
-        self.sitk_image = other.sitk_image
-        self.image_meta = other.image_meta
-        self.sitk_ndarray = other.sitk_ndarray
-        self.series_file_names = other.series_file_names
-        return
+    def setLogLevel (level):
+        logging.basicConfig(level=level)
+
+        # make sure we can "deepcopy" this object, as simpleitk objects
+        # cannot just be copied because of some pickle error :/
+
+    def __deepcopy__(self, memo):
+        return helpers.deepcopy_with_sharing(self, shared_attribute_names = ['sitk_image', 'image_meta'], memo=memo)
+
+
+    def __reduce__(self):
+        print ("\n\nREDUCING")
+        return (self.__class__, (None,))
 
 
     def shape (self):
         return self.sitk_ndarray.shape
 
 
+    def collectFromDirectories (self, dirList):
+        sitkreader = sitk.ImageSeriesReader()
+
+        # gather all dicom files
+        file_names = []
+        for s in dirList:
+            series_IDs = sitkreader.GetGDCMSeriesIDs(s)
+            series_file_names = sitkreader.GetGDCMSeriesFileNames(s, series_IDs[0])
+            file_names.extend (series_file_names)
+        self.logger.info ("Found overall " + str(len(file_names)) + " slices")
+        sitkreader.SetFileNames(file_names)
+        self.sitk_image = sitkreader.Execute()
+
+        sitk_ndarray = sitk.GetArrayFromImage(self.sitk_image)
+        z,y,x = sitk_ndarray.shape
+        origin = np.array(self.sitk_image.GetOrigin())
+        spacing = np.array(self.sitk_image.GetSpacing())
+
+        # get Metadata and save as image_meta
+        image_reader = sitk.ImageFileReader()
+        image_reader.LoadPrivateTagsOn()
+        image_meta = []
+        for file_name in file_names:
+            image_reader.SetFileName(file_name)
+            img = image_reader.Execute()
+            image_meta.append(img)
+        self.sitk_ndarray = sitk_ndarray
+        self.image_meta = image_meta
+        self.series_file_names = file_names
+
+        # what do we do with the drunken sailor?
+        return 0
+
+
+
+
+
+
     def loadFromDirectory (self, dicom_directory):
         sitkreader = sitk.ImageSeriesReader()
+
+        # extra check for evidence documents-- if its an evidence document, we ignore thisself.
+        if self.filterDICOM == True:
+            allFiles = [join(dicom_directory,f) for f in listdir(dicom_directory) if isfile(join(dicom_directory, f))]
+            firstDICOM = pydicom.dcmread(allFiles[0])
+
+            desc = firstDICOM.SeriesDescription
+            if 'Evidence Documents' in desc:
+                self.logger.info ("Found Evidence Document, ignoring this series.")
+                return (-1)
+            if 'Tissue4D' in desc:
+                self.logger.info ("Found Tissue 4D Collection, ignoring this series.")
+                return (-1)
+            if 'iAuc ' in desc: # or 'Kep ' in desc or 'Ktrans ' in desc or 'Ve ' in desc:
+                self.logger.info ("Found iAUC output, ignoring this series.")
+                return (-1)
+
+
 
         # check if there is a DICOM series in the dicom_directory
         series_IDs = sitkreader.GetGDCMSeriesIDs(dicom_directory)
         if not series_IDs:
-            print("ERROR: given directory \""+dicom_directory+"\" does not contain a DICOM series.")
+            self.logger.error ("Given directory \""+dicom_directory+"\" does not contain a DICOM series.")
             return (-1)
 
         series_file_names = sitkreader.GetGDCMSeriesFileNames(dicom_directory, series_IDs[0])
@@ -69,25 +141,26 @@ class DICOM (object):
         self.sitk_ndarray = sitk_ndarray
         self.image_meta = image_meta
         self.series_file_names = series_file_names
+
+        # what do we do with the drunken sailor?
         return 0
 
 
-    def log (self, s, l = 5):
-        if self.debugLevel >= l:
-            print (s)
-
-    def error (self, s):
-        print ("ERROR:", s)
-        exit(-1)
 
 
     # TODO: rename
     def extractMetaTag (self, tag, imageNumber = None):
         # mmh.
+        if tag == "SeriesDescription":
+            tag = "0008|103e"
+        if tag == "ProtocolName":
+            tag = "0018|1030"
         if tag == "RepetitionTime":
             tag = "0018|0080"
         if tag == "FlipAngle":
             tag = "0018|1314"
+        if tag == "SliceLocation":
+            tag = "0020|1041"
         if tag == "ContentTime":
             tag = "0008|0033"
         if tag == "AcquisitionNumber":
@@ -103,10 +176,12 @@ class DICOM (object):
 
         # check
         if imageNumber < 0 or imageNumber >= len(self.image_meta):
-            self.error ("No image with number " + image + " can be found.")
+            self.logger.error ("No image with number " + image + " can be found.")
+            return (-1)
 
         v = self.image_meta[imageNumber].GetMetaData(tag)
         return v
+
 
 
 
@@ -118,10 +193,10 @@ class DICOM (object):
         else:
             downloadDir = saveDir
 
-        self.log ("Downloading series " + str(seriesID) + " to directory " + str(downloadDir))
+        self.logger.info ("Downloading series " + str(seriesID) + " to directory " + str(downloadDir))
         o.downloadSeries (seriesID, downloadDir, True)
 
-        self.log ("Loading series from directory " + str(downloadDir))
+        self.logger.debug ("Loading series from directory " + str(downloadDir))
         self.loadFromDirectory (downloadDir)
 
         # if the directory was temporarily set by us, we remove it
@@ -162,7 +237,7 @@ class DICOM (object):
 
 
     def saveToDirectory (self, destDir, seriesUID, seriesDescription, createFolder = True):
-        self.log ("Saving DICOM with SeriesUID " + seriesUID + " to directory " + destDir)
+        self.logger.info ("Saving DICOM with SeriesUID " + seriesUID + " to directory " + destDir)
         # make sure the directory exists
         if not os.path.exists(destDir):
             os.makedirs(destDir)

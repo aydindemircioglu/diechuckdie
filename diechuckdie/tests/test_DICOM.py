@@ -5,4 +5,4 @@ import diechuckdie
 class TestDICOM(TestCase):
     def test_loadDICOM (self):
         D = diechuckdie.DICOM()
-        self.assertTrue(isinstance(s, object))
+        self.assertTrue(isinstance(D, object))

@@ -1,5 +1,6 @@
 
 
+import warnings
 import datetime
 from joblib import Parallel, delayed
 from copy import deepcopy
@@ -12,16 +13,18 @@ import numpy as np
 import SimpleITK as sitk
 from glob import glob
 import sys, time, os
-import dicom
+#import dicom
 import os, os.path, sys, configparser, collections
 import importlib.util
 from jsonpath_rw import jsonpath, parse
 import scipy.misc
 from numpy import sin, cos, tan, exp
-from tqdm import tqdm_notebook
+#from tqdm import tqdm_notebook
 
 
-from DICOM import DICOM
+from . import helpers
+from . import DICOM
+
 
 class FlipAngleDICOM (object):
    def __init__ (self):
@@ -130,13 +133,16 @@ class FlipAngleDICOM (object):
 
    def t1_signal_eqn (self, x, R10, M0):
        E10 = exp(-self.TR*R10)
-       return M0*sin(x)*(1.0 - E10) / (1.0 - E10*cos(x))
+       t = M0*sin(x)*(1.0 - E10) / (1.0 - E10*cos(x))
+       return t
 
 
 
    def getCoeff (self, method, t1_signal_eqn, flipAngles, y):
        if method == "curve_fit":
            try:
+               with warnings.catch_warnings():
+                   warnings.simplefilter("ignore")
                popt, _ = curve_fit (t1_signal_eqn, flipAngles, y)
            except RuntimeError:
                popt = [0, 0]
@@ -190,9 +196,11 @@ class FlipAngleDICOM (object):
 
 
 
-   def computeT10Image (self, slice = None, minMean = 0.05):
+   def computeT10Image (self, slices = None, minMean = 0.05):
        # first make sure that the members all do fit somehow
        # so co-register them to get the smallest volume
+      # FIXME: make sure that the flip angles all have the same volume/slices
+      # so we can just take any member to copy our T10,S0 images into them.
 
        # work on copies.
 
@@ -210,6 +218,7 @@ class FlipAngleDICOM (object):
 
        # T10 Data has the same shape, but only one volume
        T10Data = np.zeros ( volumes.shape[:-1], dtype = np.float32 )
+       S0Data = np.zeros ( volumes.shape[:-1], dtype = np.float32 )
 
        # for each slice
        nSlices = volumes.shape[0]
@@ -234,25 +243,75 @@ class FlipAngleDICOM (object):
                T10_[T10_ < 0] = 0
 
            T10Data [s, :, :] = T10_
+           S0Data [s, :, :] = S0_
 
-       if slice is None:
-           slice = list(range(nSlices))
-       try:
-           iterator = iter(slice)
-       except TypeError:
-           slice = [slice]
+       slices = helpers.getSliceList (slices, nSlices)
 
-       self.log("Computing slices " + str(list(slice)))
-       [computeSlice(i) for i in tqdm(slice)]
+       self.log("Computing slices " + str(list(slices)))
+       [computeSlice(i) for i in tqdm(slices)]
 
-
+       # create a DICOM from S0 data
+       S0DICOM = deepcopy (self.members[0])
+       S0DICOM.sitk_ndarray = S0Data.copy()
 
        # create a DICOM image from the T10 data
+       T10DICOM = deepcopy (self.members[0])
+       T10DICOM.sitk_ndarray = T10Data.copy()
 
-       # as we have the same volume as any of the flip images
-       # FIXME: make sure that this is the case
-       # we can just take any member to modify it
-       T10DICOM = DICOM()
-       T10DICOM.copyFrom (self.members[0])
-       T10DICOM.sitk_ndarray = T10Data
-       return T10DICOM
+       return T10DICOM, S0DICOM
+
+
+
+
+   def computeR10Image (self, slices = None, minMean = 0.05):
+       # first make sure that the members all do fit somehow
+       # so co-register them to get the smallest volume
+
+       # FIXME: make sure that the flip angles all have the same volume/slices
+       # so we can just take any member to copy our T10,S0 images into them.
+
+
+       # work on copies.
+
+       if len(self.members) == 0:
+           error ("No flip angles added.")
+
+       # create an numpy array from the member copies
+       data = self.members[0].getAsArray ()
+       volumes = np.zeros ( data.shape + (len(self.members),), dtype = np.float32 )
+       volumes [:, :, :, 0] = data
+
+       for m in range(1, len(self.members)):
+           data = self.members[m].getAsArray ()
+           volumes [:, :, :, m] = data
+
+       # T10 Data has the same shape, but only one volume
+       R10Data = np.zeros ( volumes.shape[:-1], dtype = np.float32 )
+       S0Data = np.zeros ( volumes.shape[:-1], dtype = np.float32 )
+
+       # for each slice
+       nSlices = volumes.shape[0]
+       self.log ("Volume shape: " + str (volumes.shape))
+       self.log ("Number of slices: " + str (nSlices))
+
+       def computeSlice (s):
+           timeVolForSlice = volumes[s, :, :, :]  # put the slice from all members together
+           R10_, S0_ = self.fit_R10(timeVolForSlice, self.flipAngles, self.TR, minMean = minMean)
+           R10Data [s, :, :] = R10_
+           S0Data [s, :, :] = S0_
+
+       slices = helpers.getSliceList (slices, nSlices)
+
+       self.log("Computing slices " + str(list(slices)))
+       for i in tqdm(slices):
+           computeSlice(i)
+
+       # create a DICOM from S0 data
+       S0DICOM = deepcopy (self.members[0])
+       S0DICOM.sitk_ndarray = S0Data
+
+       # create a DICOM image from the T10 data
+       R10DICOM = deepcopy (self.members[0])
+       R10DICOM.sitk_ndarray = R10Data
+
+       return R10DICOM, S0DICOM
